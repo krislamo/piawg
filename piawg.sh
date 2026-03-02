@@ -106,9 +106,9 @@ fi
 : "${BAO_PATH_TOKEN:=piawg/session/token}"
 
 # Must set these in PIAWG_CONF
-: "${BAO_ADDR:?\[ERROR\]: BAO_ADDR is not set}"
-: "${BAO_ROLE:?\[ERROR\]: BAO_ROLE is not set}"
-: "${BAO_SECRET:?\[ERROR\]: BAO_SECRET is not set}"
+: "${BAO_ADDR:?[ERROR]: BAO_ADDR is not set}"
+: "${BAO_ROLE:?[ERROR]: BAO_ROLE is not set}"
+: "${BAO_SECRET:?[ERROR]: BAO_SECRET is not set}"
 
 # Get ephemeral session token from AppRole login
 if ! bao_token_reply=$(curl -sS \
