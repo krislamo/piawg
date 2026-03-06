@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: 0BSD
 # SPDX-FileCopyrightText: 2026 Kris Lamoureux <kris@lamoureux.io>
 
+# Allow local variable scoping, therefore not strictly POSIX
+# shellcheck disable=SC3043
+
 err() {
 	printf '[ERROR]: %s\n' "$1" >&2
 	exit 1
@@ -14,63 +17,159 @@ check_http() {
 	esac
 }
 
+# Check for plausible looking PIA token
+check_token() {
+	printf '%s\n' "$1" | grep -q '^[0-9A-Fa-f]\{128\}$'
+}
+
 bao_curl() {
-	curl -sS --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 2 \
+	local path
+	local response
+	local error
+	local http_code
+	local notfound
+	notfound=0
+	while getopts "n" opt; do
+		case "$opt" in
+		n) notfound=1 ;;
+		*) err "bao_curl option '$opt' not found" ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	path="$1"
+	shift
+	error="Failed request to '$BAO_ADDR/v1/$path'"
+	if ! response=$(curl -sS --connect-timeout 5 \
+		--max-time 20 --retry 5 --retry-delay 2 \
 		-H 'Content-Type: application/json' \
 		-H "X-Vault-Token: $bao_token" \
 		-w '\n%{http_code}' \
-		"$@"
-}
-
-# Fetch latest token in OpenBao
-get_token() {
-	if ! pia_token_reply=$(bao_curl \
-		"$BAO_ADDR/v1/$BAO_KV_MOUNT/data/$BAO_PATH_TOKEN"); then
-		err "Failed to fetch PIA token from '$BAO_ADDR'"
+		"$@" "$BAO_ADDR/v1/$path"); then
+		err "$error"
 	fi
-	printf '%s' "$pia_token_reply"
-	unset pia_token_reply
+	http_code="$(printf '%s' "$response" | tail -1)"
+	if [ "$http_code" = "404" ]; then
+		[ "$notfound" -eq 1 ] && return 4
+		err "$error (404)"
+	fi
+	check_http "$http_code" || err "$error"
+	printf '%s' "$response" | sed '$d'
 }
 
-# Get a new PIA token and store
+opn_curl() {
+	local path
+	local error
+	local response
+	local http_code
+	path="$1"
+	shift
+	error="Failed request to '$opn_endpoint/$path'"
+	if ! response="$(curl -sS --connect-timeout 5 \
+		--max-time 20 --retry 5 --retry-delay 2 \
+		-H 'Content-Type: application/json' \
+		-u "$opn_key:$opn_secret" \
+		-w '\n%{http_code}' \
+		"$@" "$opn_endpoint/$path")"; then
+		err "$error"
+	fi
+	http_code="$(printf '%s' "$response" | tail -1)"
+	check_http "$http_code" || err "$error"
+	printf '%s' "$response" | sed '$d'
+}
+
+pia_addkey() {
+	local response
+	local key
+	local port
+	local peer_ip
+	local updates
+	# Add pubkey via PIA API and get connection details
+	if ! response=$(
+		curl -sS -G --connect-timeout 5 \
+			--max-time 20 --retry 5 --retry-delay 2 \
+			--resolve "$server_cn:$server_port:$server_ip" \
+			--cacert ./ca.rsa.4096.crt \
+			--data-urlencode "pt=$pia_token" \
+			--data-urlencode "pubkey=$piawg_pubkey" \
+			"https://$server_cn:1337/addKey"
+	); then
+		err "Failed connect to $server_cn to addKey"
+	fi
+	[ "$(printf '%s' "$response" | jq -r '.status')" != "OK" ] &&
+		err "Failed to addKey to $server_cn"
+
+	# Update Wireguard config on OPNsense
+	updates='{}'
+	if [ "$server_ip" != "$piawgsrv_srvaddr" ]; then
+		updates="$(printf '%s' "$updates" |
+			jq --arg a "$server_ip" '.serveraddress = $a')"
+	fi
+	key="$(printf '%s' "$response" | jq -r '.server_key')"
+	if [ "$key" != "$piawgsrv_pubkey" ]; then
+		updates="$(printf '%s' "$updates" | jq --arg k "$key" '.pubkey = $k')"
+	fi
+	port="$(printf '%s' "$response" | jq -r '.server_port')"
+	if [ "$port" != "$piawgsrv_srvport" ]; then
+		updates="$(printf '%s' "$updates" |
+			jq --arg p "$port" '.serverport = $p')"
+	fi
+	if [ "$updates" != '{}' ]; then
+		updates="$(printf '%s' "$updates" |
+			jq --arg s "$piawg_uuid" '.servers = $s')"
+		if [ "$(opn_curl "wireguard/client/setClient/$piawgsrv_uuid" \
+			-d "$(printf '%s' "$updates" | jq '{client: .}')" |
+			jq -r '.result')" != "saved" ]; then
+			err "Failed to update $OPN_PEER pubkey/port"
+		fi
+	fi
+	peer_ip="$(printf '%s' "$response" | jq -r '.peer_ip')"
+	if [ "$peer_ip" != "$piawg_tunaddr" ]; then
+		if [ "$(opn_curl "wireguard/server/setServer/$piawg_uuid" \
+			-d "$(jq -n --arg ip "$peer_ip/32" \
+				'{server: {tunneladdress: $ip}}')" |
+			jq -r '.result')" != "saved" ]; then
+			err "Failed to update $OPN_WG tunnel address to $peer_ip"
+		fi
+	fi
+	opn_curl 'wireguard/service/reconfigure' -d '{}'
+
+	# Update firewall rule alias
+	piawg_ip_alias="$(opn_curl 'firewall/alias/searchItem' -d '{}' |
+		jq -r '.rows[] | select(.name == "PIAwg_IP") | .uuid')"
+	opn_curl "firewall/alias/setItem/$piawg_ip_alias" \
+		-d "$(jq -n --arg ip "$peer_ip" '{alias: {content: $ip}}')"
+	opn_curl 'firewall/alias/reconfigure' -d '{}'
+}
+
+# Get a new PIA API token and store
 renew_token() {
-	login_response="$(bao_curl "$BAO_ADDR/v1/$BAO_KV_MOUNT/data/$BAO_PATH_LOGIN")"
+	local login_response
+	local token_response
+	local pia_user
+	local pia_pass
+	local pia_token
 
-	http_code="$(printf '%s' "$login_response" | tail -1)"
-	if ! check_http "$http_code"; then
-		err "Failed to get PIA login details (HTTP $http_code)"
-	fi
-	unset http_code
-
-	login_response="$(printf '%s' "$login_response" | sed '$d')"
+	login_response="$(bao_curl "$BAO_KV_MOUNT/data/$BAO_PATH_PIA")"
 	pia_user="$(printf '%s' "$login_response" | jq -r '.data.data.username')"
 	pia_pass="$(printf '%s' "$login_response" | jq -r '.data.data.password')"
 	unset login_response
-	if ! token_reply="$(curl -s -X POST "$PIA_API" \
+	if ! token_response="$(curl -s -X POST "$PIA_API" \
 		-F "username=$pia_user" \
 		-F "password=$pia_pass")"; then
 		err "Failed to get a new PIA token"
 	fi
 	unset pia_pass
 	unset pia_user
-	pia_token="$(echo "$token_reply" | jq -r .token)"
-	unset token_reply
-	if ! printf '%s' "$pia_token" | grep -Eq '^[0-9A-Fa-f]{128}$'; then
-		err "Invalid token found during renewal attempt"
-	fi
-	if ! update_response="$(bao_curl -X POST -d "$(jq -n --arg t "$pia_token" '{data:{token:$t}}')" \
-		"$BAO_ADDR/v1/$BAO_KV_MOUNT/data/$BAO_PATH_TOKEN")"; then
-		err "Failed to save PIA token to '$BAO_ADDR'"
-	fi
+	pia_token="$(echo "$token_response" | jq -r .token)"
+	unset token_response
+	check_token "$pia_token" || err "Invalid PIA token during renewal attempt"
+	bao_curl "$BAO_KV_MOUNT/data/$BAO_PATH_TOKEN" -X POST \
+		-d "$(jq -n --arg t "$pia_token" '{data:{token:$t}}')"
 	unset pia_token
-	http_code="$(printf '%s' "$update_response" | tail -1)"
-	update_response="$(printf '%s' "$update_response" | sed '$d')"
-	check_http "$http_code" ||
-		err "Failed to write PIA token to OpenBao (HTTP $http_code)"
 }
 
 # Check for required external commands
-for rbin in curl jq; do
+for rbin in curl jq openssl; do
 	command -v "$rbin" >/dev/null 2>&1 ||
 		err "Required binary '$rbin' not found"
 done
@@ -98,17 +197,24 @@ else
 	err "Can't find config at '$PIAWG_CONF'"
 fi
 
-# Overridable defaults
-: "${PIA_API:=https://www.privateinternetaccess.com/api/client/v2/token}"
-: "${BAO_AUTH_PATH:=approle}"
-: "${BAO_KV_MOUNT:=kv}"
-: "${BAO_PATH_LOGIN:=piawg/creds/login}"
-: "${BAO_PATH_TOKEN:=piawg/session/token}"
-
 # Must set these in PIAWG_CONF
 : "${BAO_ADDR:?[ERROR]: BAO_ADDR is not set}"
 : "${BAO_ROLE:?[ERROR]: BAO_ROLE is not set}"
 : "${BAO_SECRET:?[ERROR]: BAO_SECRET is not set}"
+
+# Overridable defaults
+_fingerprint=1fd25658456eab3041fba77ccd398ab8124edcc1b8b2fc1d55fdf6b1bbfc9d70
+: "${PIA_API:=https://www.privateinternetaccess.com/api/client/v2/token}"
+: "${PIA_CRT:=https://www.privateinternetaccess.com/openvpn/ca.rsa.4096.crt}"
+: "${PIA_HASH:=$_fingerprint}"
+: "${BAO_AUTH_PATH:=approle}"
+: "${BAO_KV_MOUNT:=kv}"
+: "${BAO_PATH_CONFIG:=piawg/config/wireguard}"
+: "${BAO_PATH_OPNSENSE:=piawg/creds/opnsense}"
+: "${BAO_PATH_PIA:=piawg/creds/pia}"
+: "${BAO_PATH_TOKEN:=piawg/session/token}"
+: "${OPN_IF:=PIAwg}"
+: "${OPN_PEER:=PIAwg_srv}"
 
 # Get ephemeral session token from AppRole login
 if ! bao_token_reply=$(curl -sS \
@@ -126,22 +232,74 @@ unset bao_token_reply
 [ -n "$bao_token" ] || err "Failed to get token from '$BAO_ADDR'"
 
 # Get latest PIA token
-get_token_reply="$(get_token)"
-http_code="$(printf '%s' "$get_token_reply" | tail -1)"
-get_token_reply="$(printf '%s' "$get_token_reply" | sed '$d')"
-
-# Renew token if path doesn't exist yet
-if [ "$http_code" -eq 404 ]; then
+get_token_reply="$(
+	bao_curl -n "$BAO_KV_MOUNT/data/$BAO_PATH_TOKEN"
+)" && rc=0 || rc=$?
+if [ "$rc" -eq 4 ]; then
 	renew_token
-	get_token_reply="$(get_token)"
-	http_code="$(printf '%s' "$get_token_reply" | tail -1)"
-	get_token_reply="$(printf '%s' "$get_token_reply" | sed '$d')"
-	if ! check_http "$http_code"; then
-		err "Failed to get PIA token after renewal"
-	fi
-elif ! check_http "$http_code"; then
-	err "Failed to get PIA token from '$BAO_ADDR' (HTTP $http_code)"
+	get_token_reply="$(bao_curl "$BAO_KV_MOUNT/data/$BAO_PATH_TOKEN")"
+fi
+pia_token="$(printf '%s' "$get_token_reply" | jq -r .data.data.token)"
+unset get_token_reply
+check_token "$pia_token" || err "Failed to get valid PIA token"
+
+# Download PIA RSA CA certificate
+if [ ! -f ./ca.rsa.4096.crt ]; then
+	[ -f ./.ca.rsa.4096.crt ] && rm ./.ca.rsa.4096.crt
+	curl -sS --connect-timeout 5 --max-time 20 --retry 5 --retry-delay 2 \
+		-o ./.ca.rsa.4096.crt "$PIA_CRT"
+	pia_file_hash="$(openssl x509 -in ./.ca.rsa.4096.crt -outform DER |
+		openssl dgst -sha256 -r | awk '{print $1}')"
+	[ "$pia_file_hash" != "$PIA_HASH" ] && err "PIA CA fingerprint mismatch"
+	mv ./.ca.rsa.4096.crt ./ca.rsa.4096.crt
 fi
 
-printf '%s\n' "$get_token_reply"
-exit 0
+# Get OPNsense login details
+bao_opn_login="$(bao_curl "$BAO_KV_MOUNT/data/$BAO_PATH_OPNSENSE")"
+opn_key="$(printf '%s' "$bao_opn_login" | jq -r .data.data.key)"
+opn_secret="$(printf '%s' "$bao_opn_login" | jq -r .data.data.secret)"
+opn_endpoint="$(printf '%s' "$bao_opn_login" | jq -r .data.data.endpoint)"
+opn_endpoint="${opn_endpoint%/}"
+
+# Get OPNsense Wireguard config
+opn_if_reply="$(opn_curl 'wireguard/server/searchServer' -d '{}' |
+	jq ".rows[] | select(.name == \"$OPN_IF\")")"
+piawg_uuid="$(printf '%s' "$opn_if_reply" | jq -r .uuid)"
+piawg_pubkey="$(printf '%s' "$opn_if_reply" | jq -r .pubkey)"
+piawg_tunaddr="$(printf '%s' "$opn_if_reply" | jq -r .tunneladdress)"
+echo "$opn_if_reply" | jq .
+unset opn_if_reply
+
+opn_peer_reply="$(opn_curl 'wireguard/client/searchClient' -d '{}' |
+	jq ".rows[] | select(.name == \"$OPN_PEER\")")"
+piawgsrv_uuid="$(printf '%s' "$opn_peer_reply" | jq -r .uuid)"
+piawgsrv_pubkey="$(printf '%s' "$opn_peer_reply" | jq -r .pubkey)"
+piawgsrv_srvaddr="$(printf '%s' "$opn_peer_reply" | jq -r .serveraddress)"
+piawgsrv_srvport="$(printf '%s' "$opn_peer_reply" | jq -r .serverport)"
+echo "$opn_peer_reply" | jq .
+unset opn_peer_reply
+
+# Get target server IP, common name, and OPNsense WG pubkey
+wg_reply="$(bao_curl "$BAO_KV_MOUNT/data/$BAO_PATH_CONFIG")"
+server_ip="$(printf '%s' "$wg_reply" | jq -r .data.data.server_ip)"
+server_cn="$(printf '%s' "$wg_reply" | jq -r .data.data.server_cn)"
+server_port="$(printf '%s' "$wg_reply" | jq -r .data.data.server_port)"
+echo "$wg_reply" | jq .
+unset wg_reply
+
+# Update to reflect desired state
+[ "$server_ip" != "$piawgsrv_srvaddr" ] && pia_addkey
+
+# Check tunnel
+piawg_tunaddr="$(opn_curl 'wireguard/server/searchServer' -d '{}' |
+	jq -r ".rows[] | select(.name == \"$OPN_IF\") | .tunneladdress")"
+wg_status_reply="$(opn_curl 'wireguard/service/show' -d '{}' |
+	jq ".rows[] | select(.name == \"$OPN_PEER\")")"
+echo "$wg_status_reply" | jq .
+wg_status="$(printf '%s' "$wg_status_reply" | jq -r '."peer-status"')"
+[ ! "$wg_status" = "online" ] && err "$OPN_PEER is offline"
+if ! ping -c1 -W3 -S "${piawg_tunaddr%/32}" 1.1.1.1 >/dev/null 2>&1; then
+	if ! ping -c1 -W3 -S "${piawg_tunaddr%/32}" 8.8.8.8 >/dev/null 2>&1; then
+		err "$OPN_PEER failed to ping internet"
+	fi
+fi
