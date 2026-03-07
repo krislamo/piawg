@@ -5,27 +5,13 @@
 # Allow local variable scoping, therefore not strictly POSIX
 # shellcheck disable=SC3043
 
-err() {
-	printf '[ERROR]: %s\n' "$1" >&2
-	exit 1
-}
+msg() { printf '[%s]: %s\n' "${2-INFO}" "$1"; }
+info() { [ "$PIAWG_VERBOSE" -eq 1 ] && msg "$1"; }
+warn() { msg "$1" 'WARN'; }
+err() { msg "$1" 'ERROR'; exit 1; }
 
-info() {
-	[ "$PIAWG_VERBOSE" -eq 1 ] &&
-		printf '[INFO]: %s\n' "$1" >&2
-}
-
-check_http() {
-	case $1 in
-	"${2:-200}") return 0 ;;
-	*) return 1 ;;
-	esac
-}
-
-# Check for plausible looking PIA token
-check_token() {
-	printf '%s\n' "$1" | grep -q '^[0-9A-Fa-f]\{128\}$'
-}
+check_http() { [ "$1" = "${2:-200}" ] && return 0 || return 1; }
+check_token() { printf '%s\n' "$1" | grep -q '^[0-9A-Fa-f]\{128\}$'; }
 
 _curl() {
 	curl -sS --connect-timeout 5 --max-time 20 \
@@ -150,14 +136,14 @@ pia_addkey() {
 	if [ "$(echo "$piawg_ip_update" | jq -r '.result')" != "saved" ]; then
 		err "Failed to update $OPN_ALIAS"
 	fi
-	info "Reloading Firewall alias"
+	info "Applying alias update to the firewall"
 	if [ "$(opn_curl 'firewall/alias/reconfigure' -d '{}' |
 		jq -r '.status')" != "ok" ]; then
 		err "Failed to reconfigure the firewall alias $OPN_ALIAS"
 	fi
 }
 
-tunnel_check() {
+check_tunnel() {
 	local tunneladdr
 	local response
 	local peer_status
@@ -332,15 +318,25 @@ unset wg_reply
 if [ "$server_ip" != "$piawgsrv_srvaddr" ]; then
 	info "Updating $OPN_IF tunnel with new IP $server_ip"
 	pia_addkey
-	if tunnel_check; then
+	info "Pausing 2 seconds for new tunnel"
+	sleep 2
+	if check_tunnel; then
 		info "New tunnel on $OPN_IF is working"
 	else
 		err "New tunnel on $OPN_IF is broken"
 	fi
 else
-	if tunnel_check; then
+	if check_tunnel; then
 		info "Tunnel on $OPN_IF is working"
 	else
-		err "Tunnel on $OPN_IF is broken"
+		warn "Tunnel on $OPN_IF is broken"
+		pia_addkey
+		info "Pausing 2 seconds for new tunnel"
+		sleep 2
+		if check_tunnel; then
+			info "New tunnel on $OPN_IF is working"
+		else
+			err "New tunnel on $OPN_IF is broken"
+		fi
 	fi
 fi
