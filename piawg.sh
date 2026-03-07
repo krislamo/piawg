@@ -5,10 +5,24 @@
 # Allow local variable scoping, therefore not strictly POSIX
 # shellcheck disable=SC3043
 
-msg() { printf '[%s]: %s\n' "${2-INFO}" "$1"; }
+msg() {
+	local format
+	format='%s'
+	OPTIND=1
+	while getopts 'f:' opt; do
+		case $opt in f) format="$OPTARG" ;; *) return 1 ;; esac
+	done
+	shift $((OPTIND - 1))
+	printf "[%s]: ${format}\n" "${2-INFO}" "$1"
+}
+
 info() { [ "$PIAWG_VERBOSE" -eq 1 ] && msg "$1"; }
+debug() { [ "$PIAWG_DEBUG" -eq 1 ] && msg "$@" 'DEBUG'; }
 warn() { msg "$1" 'WARN'; }
-err() { msg "$1" 'ERROR'; exit 1; }
+err() {
+	msg "$1" 'ERROR'
+	exit 1
+}
 
 check_http() { [ "$1" = "${2:-200}" ] && return 0 || return 1; }
 check_token() { printf '%s\n' "$1" | grep -q '^[0-9A-Fa-f]\{128\}$'; }
@@ -24,10 +38,14 @@ bao_curl() {
 	local error
 	local http_code
 	local notfound
+	local content_type
 	notfound=0
-	while getopts "n" opt; do
+	content_type='application/json'
+	OPTIND=1
+	while getopts "np" opt; do
 		case "$opt" in
 		n) notfound=1 ;;
+		p) content_type='application/merge-patch+json' ;;
 		*) err "bao_curl option '$opt' not found" ;;
 		esac
 	done
@@ -35,7 +53,7 @@ bao_curl() {
 	path="$BAO_ADDR/v1/$1"
 	shift
 	error="Failed request to '$path'"
-	if ! response=$(_curl -H 'Content-Type: application/json' \
+	if ! response=$(_curl -H "Content-Type: $content_type" \
 		-H "X-Vault-Token: $bao_token" -w '\n%{http_code}' "$@" "$path"); then
 		err "$error"
 	fi
@@ -72,6 +90,7 @@ pia_addkey() {
 	local port
 	local peer_ip
 	local updates
+	local server_vip
 	# Add pubkey via PIA API and get connection details
 	info "Adding '$piawg_pubkey' to PIA server $server_cn"
 	if ! response=$(
@@ -85,6 +104,7 @@ pia_addkey() {
 	fi
 	[ "$(printf '%s' "$response" | jq -r '.status')" != "OK" ] &&
 		err "Failed to addKey to $server_cn"
+	debug -f 'PIA API addKey response\n%s' "$(echo "$response" | jq .)"
 
 	# Update Wireguard config on OPNsense
 	updates='{}'
@@ -105,6 +125,7 @@ pia_addkey() {
 		updates="$(printf '%s' "$updates" |
 			jq --arg s "$piawg_uuid" '.servers = $s')"
 		info "Updating connection details of $OPN_IF peer $OPN_PEER"
+		debug -f "$OPN_PEER updates\n%s" "$(echo "$updates" | jq .)"
 		if [ "$(opn_curl "wireguard/client/setClient/$piawgsrv_uuid" \
 			-d "$(printf '%s' "$updates" | jq '{client: .}')" |
 			jq -r '.result')" != "saved" ]; then
@@ -126,6 +147,12 @@ pia_addkey() {
 		jq -r '.result')" != "ok" ]; then
 		err "Failed to reload Wireguard service"
 	fi
+
+	# Update OpenBao config with response data
+	server_vip="$(printf '%s' "$response" | jq -r '.server_vip')"
+	info "Update server_vip at $BAO_PATH_CONFIG to $server_vip"
+	bao_curl -p "$BAO_KV_MOUNT/data/$BAO_PATH_CONFIG" -X PATCH -d \
+		"$(jq -n --arg ip "$server_vip" '{data:{server_vip:$ip}}')" >/dev/null
 
 	# Update firewall rule alias
 	piawg_ip_alias="$(opn_curl 'firewall/alias/searchItem' -d '{}' |
@@ -188,9 +215,15 @@ renew_token() {
 	unset pia_token
 }
 
+PIAWG_DEBUG=0
 PIAWG_VERBOSE=0
-while getopts "v" opt; do
+OPTIND=1
+while getopts "dv" opt; do
 	case $opt in
+	d)
+		PIAWG_VERBOSE=1
+		PIAWG_DEBUG=1
+		;;
 	v) PIAWG_VERBOSE=1 ;;
 	*)
 		printf '%s\n' "Usage: $0 [-v]" >&2
@@ -289,6 +322,9 @@ bao_opn_login="$(bao_curl "$BAO_KV_MOUNT/data/$BAO_PATH_OPNSENSE")"
 opn_key="$(printf '%s' "$bao_opn_login" | jq -r .data.data.key)"
 opn_secret="$(printf '%s' "$bao_opn_login" | jq -r .data.data.secret)"
 opn_endpoint="$(printf '%s' "$bao_opn_login" | jq -r .data.data.endpoint)"
+debug -f "OPNsense login details from OpenBao ($BAO_PATH_OPNSENSE)\n%s" \
+	"$(printf '%s' "$bao_opn_login" |
+		jq '.data.data.secret = "[CENSORED]" | .data.data.key = "[CENSORED]"')"
 opn_endpoint="${opn_endpoint%/}"
 
 # Get OPNsense Wireguard config
@@ -297,6 +333,8 @@ opn_if_reply="$(opn_curl 'wireguard/server/searchServer' -d '{}' |
 piawg_uuid="$(printf '%s' "$opn_if_reply" | jq -r .uuid)"
 piawg_pubkey="$(printf '%s' "$opn_if_reply" | jq -r .pubkey)"
 piawg_tunaddr="$(printf '%s' "$opn_if_reply" | jq -r .tunneladdress)"
+debug -f "Wireguard instance $OPN_IF from OPNsense API\n%s" \
+	"$(printf '%s' "$opn_if_reply" | jq '.privkey = "[CENSORED]"')"
 unset opn_if_reply
 
 opn_peer_reply="$(opn_curl 'wireguard/client/searchClient' -d '{}' |
@@ -305,6 +343,8 @@ piawgsrv_uuid="$(printf '%s' "$opn_peer_reply" | jq -r .uuid)"
 piawgsrv_pubkey="$(printf '%s' "$opn_peer_reply" | jq -r .pubkey)"
 piawgsrv_srvaddr="$(printf '%s' "$opn_peer_reply" | jq -r .serveraddress)"
 piawgsrv_srvport="$(printf '%s' "$opn_peer_reply" | jq -r .serverport)"
+debug -f "Wireguard peer $OPN_PEER from OPNsense API\n%s" \
+	"$(printf '%s' "$opn_peer_reply" | jq .)"
 unset opn_peer_reply
 
 # Get target server IP, common name, and OPNsense WG pubkey
@@ -312,6 +352,8 @@ wg_reply="$(bao_curl "$BAO_KV_MOUNT/data/$BAO_PATH_CONFIG")"
 server_ip="$(printf '%s' "$wg_reply" | jq -r .data.data.server_ip)"
 server_cn="$(printf '%s' "$wg_reply" | jq -r .data.data.server_cn)"
 server_port="$(printf '%s' "$wg_reply" | jq -r .data.data.server_port)"
+debug -f "Config from OpenBao ($BAO_PATH_CONFIG)\n%s" \
+	"$(printf '%s' "$wg_reply" | jq .)"
 unset wg_reply
 
 # Update to reflect desired state
