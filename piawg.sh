@@ -71,26 +71,35 @@ opn_curl() {
 	local error
 	local response
 	local http_code
-	path="$1"
+	path="$opn_endpoint/$1"
 	shift
-	error="Failed request to '$opn_endpoint/$path'"
+	error="Failed request to '$path'"
 	if ! response="$(_curl -H 'Content-Type: application/json' \
 		-u "$opn_key:$opn_secret" -w '\n%{http_code}' \
-		"$@" "$opn_endpoint/$path")"; then
+		"$@" "$path")"; then
 		err "$error"
 	fi
 	http_code="$(printf '%s' "$response" | tail -1)"
+	response="$(printf '%s' "$response" | sed '$d')"
+	if ! check_http "$http_code"; then
+		error_msg="$(printf '%s' "$response" |
+			jq -r '.errorMessage // empty' 2>/dev/null)"
+		[ -n "$error_msg" ] && error="$error_msg ($path)"
+	fi
 	check_http "$http_code" || err "$error"
-	printf '%s' "$response" | sed '$d'
+	printf '%s' "$response"
 }
 
 pia_addkey() {
 	local response
+	local response_gw
 	local key
 	local port
 	local peer_ip
 	local updates
 	local server_vip
+	local gateway_ip
+	local gateway_id
 	# Add pubkey via PIA API and get connection details
 	info "Adding '$piawg_pubkey' to PIA server $server_cn"
 	if ! response=$(
@@ -98,7 +107,7 @@ pia_addkey() {
 			--cacert ./ca.rsa.4096.crt \
 			--data-urlencode "pt=$pia_token" \
 			--data-urlencode "pubkey=$piawg_pubkey" \
-			"https://$server_cn:1337/addKey"
+			"https://$server_cn:$server_port/addKey"
 	); then
 		err "Failed connect to $server_cn to addKey"
 	fi
@@ -153,6 +162,34 @@ pia_addkey() {
 	info "Update server_vip at $BAO_PATH_CONFIG to $server_vip"
 	bao_curl -p "$BAO_KV_MOUNT/data/$BAO_PATH_CONFIG" -X PATCH -d \
 		"$(jq -n --arg ip "$server_vip" '{data:{server_vip:$ip}}')" >/dev/null
+
+	# Update gateway address
+	if ! response_gw="$(opn_curl \
+		'routing/settings/search_gateway' -X POST -d '{}')"; then
+		err "Failed to search gateways"
+	fi
+	debug -f "search_gateway\n%s" "$(printf '%s' "$response_gw" | jq .)"
+	gateway_id="$(printf '%s' "$response_gw" | jq -r --arg name "$OPN_GW" \
+		'.rows[] | select(.name == $name) | .uuid')"
+	gateway_ip="$(printf '%s' "$response_gw" | jq -r --arg name "$OPN_GW" \
+		'.rows[] | select(.name == $name) | .gateway')"
+	if [ "$gateway_ip" != "$server_vip" ]; then
+		info "Updating gateway $OPN_GW address from $gateway_ip to $server_vip"
+		if ! update_gw="$(opn_curl \
+			"routing/settings/set_gateway/$gateway_id" -X POST \
+			-d "$(jq -nc --arg ip "$server_vip" \
+				'{gateway_item: {gateway: $ip}}')")"; then
+			err "Failed to update gateway ($gateway_id)"
+		fi
+		if [ "$(printf '%s' "$update_gw" | jq -r '.result')" != "saved" ]; then
+			err "Failed to save gateway update"
+		fi
+		info "Restarting WireGuard interface after gateway update"
+		if [ "$(opn_curl "core/service/restart/wireguard/$piawg_uuid" \
+			-X POST -d '{}' | jq -r '.result')" != "ok" ]; then
+			err "Failed to restart WireGuard interface after gateway update"
+		fi
+	fi
 
 	# Update firewall rule alias
 	piawg_ip_alias="$(opn_curl 'firewall/alias/searchItem' -d '{}' |
@@ -282,6 +319,7 @@ _fingerprint=1fd25658456eab3041fba77ccd398ab8124edcc1b8b2fc1d55fdf6b1bbfc9d70
 : "${OPN_IF:=PIAwg}"
 : "${OPN_PEER:=PIAwg_srv}"
 : "${OPN_ALIAS:=PIAwg_IP}"
+: "${OPN_GW:=PIAWG_VPN}"
 
 # Get ephemeral session token from AppRole login
 if ! bao_token_reply=$(_curl -H 'Content-Type: application/json' \
@@ -352,6 +390,7 @@ wg_reply="$(bao_curl "$BAO_KV_MOUNT/data/$BAO_PATH_CONFIG")"
 server_ip="$(printf '%s' "$wg_reply" | jq -r .data.data.server_ip)"
 server_cn="$(printf '%s' "$wg_reply" | jq -r .data.data.server_cn)"
 server_port="$(printf '%s' "$wg_reply" | jq -r .data.data.server_port)"
+server_vip="$(printf '%s' "$wg_reply" | jq -r .data.data.server_vip)"
 debug -f "Config from OpenBao ($BAO_PATH_CONFIG)\n%s" \
 	"$(printf '%s' "$wg_reply" | jq .)"
 unset wg_reply
