@@ -207,6 +207,84 @@ pia_addkey() {
 	fi
 }
 
+pia_forward() {
+	local config
+	local server_cn
+	local server_vip
+	local pf_signature
+	local pf_payload
+	local pf_port
+	local pf_expires
+	local pf_sig_reply
+	local pf_updated_at
+	local pf_update
+	local epoch_now
+	local epoch_expire
+	local epoch_diff
+	local bind_resp
+	config="$1"
+	server_cn="$(printf '%s' "$config" | jq -r '.data.data.server_cn')"
+	server_vip="$(printf '%s' "$config" | jq -r '.data.data.server_vip')"
+	pf_signature="$(printf '%s' "$config" | jq -r '.data.data.pf_signature')"
+	pf_payload="$(printf '%s' "$config" | jq -r '.data.data.pf_payload')"
+	pf_port="$(printf '%s' "$config" | jq -r '.data.data.pf_port')"
+	pf_expires="$(printf '%s' "$config" | jq -r '.data.data.pf_expires')"
+	pf_updated_at="$(printf '%s' "$config" | jq -r '.data.data.pf_updated_at')"
+	epoch_now="$(date '+%s')"
+	epoch_expire="$(date -j -f '%Y-%m-%dT%H:%M:%S' \
+		"${pf_expires%%.*}" '+%s' 2>/dev/null)"
+	epoch_diff=$((epoch_now - ${pf_updated_at:-0}))
+	if [ -z "$epoch_expire" ] || [ "$epoch_expire" -lt "$epoch_now" ]; then
+		info "Requesting new port forward signature"
+		if ! pf_sig_reply="$(_curl -G --cacert ./ca.rsa.4096.crt \
+			--resolve "$server_cn:19999:$server_vip" \
+			--data-urlencode "token=$pia_token" \
+			"https://$server_cn:19999/getSignature")"; then
+			err "Failed to connect to https://$server_cn:19999/getSignature"
+		fi
+		debug -f "getSignature\n%s" "$(printf '%s' "$pf_sig_reply" | jq .)"
+		[ "$(printf '%s' "$pf_sig_reply" | jq -r '.status')" != "OK" ] &&
+			err "getSignature failed"
+		pf_signature="$(printf '%s' "$pf_sig_reply" | jq -r '.signature')"
+		pf_payload="$(printf '%s' "$pf_sig_reply" | jq -r '.payload')"
+		pf_port="$(printf '%s' "$pf_payload" |
+			base64 -d 2>/dev/null | jq -r '.port // empty')"
+		pf_expires="$(printf '%s' "$pf_payload" |
+			base64 -d 2>/dev/null | jq -r '.expires_at // empty')"
+		pf_update="$(jq -n --arg v "$pf_signature" '.data.pf_signature = $v')"
+		pf_update="$(printf '%s' "$pf_update" |
+			jq --arg v "$pf_payload" '.data.pf_payload = $v')"
+		pf_update="$(printf '%s' "$pf_update" |
+			jq --arg v "$pf_port" '.data.pf_port = $v')"
+		pf_update="$(printf '%s' "$pf_update" |
+			jq --arg v "$pf_expires" '.data.pf_expires = $v')"
+		pf_update="$(printf '%s' "$pf_update" |
+			jq --arg v "$(date '+%s')" '.data.pf_updated_at = $v')"
+		debug -f "pf_update\n%s" "$(printf '%s' "$pf_update" | jq .)"
+		info "Updating $BAO_PATH_CONFIG with pf_port=$pf_port"
+		bao_curl -p "$BAO_KV_MOUNT/data/$BAO_PATH_CONFIG" \
+			-X PATCH -d "$pf_update" >/dev/null
+	elif [ "$epoch_diff" -ge 300 ]; then
+		info "Renewing port forward ($epoch_diff/300)"
+		if ! bind_resp="$(_curl -G --resolve "${server_cn}:19999:${server_vip}" \
+			--data-urlencode "payload=${pf_payload}" \
+			--data-urlencode "signature=${pf_signature}" \
+			"https://${server_cn}:19999/bindPort")"; then
+			err "Failed to bindPort (https://${server_cn}:19999/bindPort)"
+		fi
+		[ "$(printf '%s' "$bind_resp" | jq -r '.status')" != "OK" ] &&
+			err "Failed to get bindPort status"
+		debug -f "bind_resp\n%s" "$(printf '%s' "$bind_resp" | jq .)"
+		pf_update="$(jq -n --arg v "$(date '+%s')" '.data.pf_updated_at = $v')"
+		debug -f "pf_update\n%s" "$(printf '%s' "$pf_update" | jq .)"
+		info "Updating pf_updated_at $BAO_PATH_CONFIG"
+		bao_curl -p "$BAO_KV_MOUNT/data/$BAO_PATH_CONFIG" \
+			-X PATCH -d "$pf_update" >/dev/null
+	else
+		info "Port forward still valid, updated ${epoch_diff}s ago"
+	fi
+}
+
 check_tunnel() {
 	local tunneladdr
 	local response
@@ -420,4 +498,13 @@ else
 			err "New tunnel on $OPN_IF is broken"
 		fi
 	fi
+fi
+
+# Optional: port forward
+if conf_reply="$(bao_curl "$BAO_KV_MOUNT/data/$BAO_PATH_CONFIG")"; then
+	debug -f "Check for port_forward value in OpenBao ($BAO_PATH_CONFIG)\n%s" \
+		"$(printf '%s' "$conf_reply" | jq .)"
+	port_forward="$(printf '%s' "$conf_reply" |
+		jq -r '.data.data.port_forward')"
+	[ "$port_forward" = "true" ] && pia_forward "$conf_reply"
 fi
