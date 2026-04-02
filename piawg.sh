@@ -405,9 +405,9 @@ if ! bao_token_reply=$(_curl -H 'Content-Type: application/json' \
 	"$BAO_ADDR/v1/auth/$BAO_AUTH_PATH/login"); then
 	err "Failed to login to '$BAO_ADDR'"
 fi
-bao_token=$(printf '%s' "$bao_token_reply" | jq -er '.auth.client_token')
+bao_token=$(printf '%s' "$bao_token_reply" | jq -er '.auth.client_token') ||
+	err "Failed to get AppRole login token from '$BAO_ADDR'"
 unset bao_token_reply
-[ -n "$bao_token" ] || err "Failed to get token from '$BAO_ADDR'"
 
 # Get latest PIA token
 get_token_reply="$(
